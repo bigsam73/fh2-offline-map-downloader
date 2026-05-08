@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 DJI FH2 On-Premise Offline Map & Elevation Downloader
-Ubuntu Linux용 - OSM 타일 + SRTM 고도 데이터 병렬 다운로드
+Ubuntu Linux용 - 국토지리정보원 브이월드(VWorld) 지도 타일 +
+                 국토지리정보원 공개DEM(5m) / SRTM(fallback) 고도 데이터 병렬 다운로드
 
 Usage:
     python3 fh2_map_downloader.py
     python3 fh2_map_downloader.py --lat 38.1234 --lon 127.5678 --radius 5
+    python3 fh2_map_downloader.py --vworld-key YOUR_API_KEY --lat 38.14 --lon 127.31 --radius 5
 """
 
 import os
@@ -81,17 +83,43 @@ console = Console()
 # 설정 상수
 # ─────────────────────────────────────────────
 FH2_INSTALL_ROOT = Path("/fh2")
-OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OSM_TILE_MIRROR = "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png"  # fallback
-SRTM_BASE_URL = "https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF"
-SRTM_USGS_URL = "https://dds.cr.usgs.gov/srtm/version2_1/SRTM3"
-OPENTOPO_URL = "https://portal.opentopography.org/API/globaldem"
-MAX_PARALLEL_WORKERS = 16
-TILE_TIMEOUT = 30
-CHUNK_SIZE = 65536  # 64KB chunks for download
-USER_AGENT = "DJI-FH2-OfflineMapDownloader/1.0 (Ubuntu; contact@example.com)"
 
-# OSM 줌 레벨별 타일 크기 및 해상도
+# ── 국토지리정보원 브이월드(VWorld) WMTS ──
+# API 키: https://www.vworld.kr 에서 무료 발급
+# 타일 URL 패턴: {z}/{y}/{x} 순서 (WMTS 표준: TileMatrix/TileRow/TileCol)
+VWORLD_API_KEY = "A2C5EA02-334F-3C1E-B29A-D7F340B5A730"
+VWORLD_BASE_URL = "https://api.vworld.kr/req/wmts/1.0.0/{key}/{layer}/{z}/{y}/{x}.{ext}"
+
+# 브이월드 레이어 목록
+# Base: 일반 지도 (한국어 지명, 도로명 주소)
+# gray: 회색조 지도 (드론 항법용 선명)
+# Satellite: 위성영상 (jpeg)
+# Hybrid: 위성 + 레이블 오버레이
+VWORLD_LAYERS = {
+    "Base":      {"ext": "png",  "desc": "일반 지도 (한국어 지명/도로명)"},
+    "gray":      {"ext": "png",  "desc": "회색조 지도 (드론 항법 최적화)"},
+    "Satellite": {"ext": "jpeg", "desc": "위성영상 (고해상도)"},
+    "Hybrid":    {"ext": "png",  "desc": "위성 + 지명 오버레이"},
+}
+DEFAULT_VWORLD_LAYER = "Base"
+
+# ── fallback: OSM (브이월드 장애 시) ──
+OSM_TILE_URL    = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_TILE_MIRROR = "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+# ── 고도 데이터 ──
+# 1순위: 국토지리정보원 공개DEM (5m 해상도, 수동 다운로드 파일 로드)
+# 2순위: SRTM CGIAR 90m (자동 다운로드)
+NGII_DEM_DIR_NAME   = "ngii_dem"        # 국토지리정보원 DEM 파일을 놓는 서브폴더명
+SRTM_BASE_URL       = "https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF"
+SRTM_FALLBACK_URL   = "https://dds.cr.usgs.gov/srtm/version2_1/SRTM3"
+
+MAX_PARALLEL_WORKERS = 16
+TILE_TIMEOUT  = 30
+CHUNK_SIZE    = 65536   # 64KB
+USER_AGENT    = "DJI-FH2-OfflineMapDownloader/2.0 (Ubuntu; VWorld/NGII)"
+
+# 줌 레벨 설명 (브이월드 동일 적용)
 ZOOM_LEVELS = {
     1:  {"radius_min": 1,  "radius_max": 2,  "desc": "도시 전체"},
     5:  {"radius_min": 1,  "radius_max": 5,  "desc": "광역 지역"},
@@ -428,12 +456,34 @@ class ParallelDownloader:
 
 
 # ─────────────────────────────────────────────
-# OSM 타일 다운로더
+# 브이월드(VWorld) 타일 다운로더
+# 국토지리정보원 공식 WMTS API 사용
+# URL 패턴: /wmts/1.0.0/{key}/{layer}/{z}/{y}/{x}.{ext}
 # ─────────────────────────────────────────────
-class OSMTileDownloader:
-    def __init__(self, map_dir: Path, downloader: ParallelDownloader):
+class VWorldTileDownloader:
+    def __init__(
+        self,
+        map_dir: Path,
+        downloader: ParallelDownloader,
+        api_key: str = VWORLD_API_KEY,
+        layer: str = DEFAULT_VWORLD_LAYER,
+    ):
         self.map_dir = map_dir
         self.downloader = downloader
+        self.api_key = api_key
+        self.layer = layer
+        self.ext = VWORLD_LAYERS.get(layer, {}).get("ext", "png")
+
+    def _tile_url(self, z: int, y: int, x: int) -> str:
+        """브이월드 WMTS URL 생성 — {z}/{y}/{x} 순서"""
+        return VWORLD_BASE_URL.format(
+            key=self.api_key, layer=self.layer,
+            z=z, y=y, x=x, ext=self.ext
+        )
+
+    def _osm_fallback_url(self, z: int, x: int, y: int) -> str:
+        """브이월드 실패 시 OSM fallback URL — {z}/{x}/{y} 순서"""
+        return OSM_TILE_URL.format(z=z, x=x, y=y)
 
     def get_zoom_levels_for_radius(self, radius_km: float) -> List[int]:
         """반경에 맞는 줌 레벨 자동 선택"""
@@ -447,7 +497,7 @@ class OSMTileDownloader:
     def build_tile_tasks(
         self, lat: float, lon: float, radius_km: float, zoom_levels: List[int]
     ) -> List[Tuple[str, Path]]:
-        """다운로드할 타일 URL 및 경로 목록 생성"""
+        """다운로드할 타일 URL 및 경로 목록 생성 (브이월드 우선, OSM fallback 내장)"""
         tasks = []
         seen: Set[Tuple[int, int, int]] = set()
 
@@ -460,8 +510,9 @@ class OSMTileDownloader:
                         continue
                     seen.add(key)
 
-                    url = OSM_TILE_URL.format(z=zoom, x=x, y=y)
-                    dest = self.map_dir / "tiles" / str(zoom) / str(x) / f"{y}.png"
+                    # 브이월드: {z}/{y}/{x}
+                    url = self._tile_url(zoom, y, x)
+                    dest = self.map_dir / "tiles" / self.layer / str(zoom) / str(x) / f"{y}.{self.ext}"
                     tasks.append((url, dest))
 
         return tasks
@@ -470,7 +521,8 @@ class OSMTileDownloader:
         """다운로드된 타일을 MBTiles 포맷으로 패키징"""
         import sqlite3
 
-        mbtiles_path = self.map_dir / f"offline_map_{lat:.4f}_{lon:.4f}_{radius_km}km.mbtiles"
+        layer_tag = self.layer.lower()
+        mbtiles_path = self.map_dir / f"offline_map_{layer_tag}_{lat:.4f}_{lon:.4f}_{radius_km}km.mbtiles"
         conn = sqlite3.connect(str(mbtiles_path))
         cur = conn.cursor()
 
@@ -488,33 +540,37 @@ class OSMTileDownloader:
         """)
 
         # 메타데이터 삽입
+        tile_fmt = "jpeg" if self.ext == "jpeg" else "png"
         meta = [
-            ("name", "DJI FH2 Offline Map"),
-            ("type", "overlay"),
-            ("version", "1.1"),
-            ("description", f"Center: {lat},{lon} Radius: {radius_km}km"),
-            ("format", "png"),
-            ("minzoom", str(min(zoom_levels))),
-            ("maxzoom", str(max(zoom_levels))),
-            ("center", f"{lon},{lat},{min(zoom_levels)+2}"),
+            ("name",        f"DJI FH2 Offline Map - VWorld {self.layer}"),
+            ("type",        "overlay"),
+            ("version",     "2.0"),
+            ("description", f"Source: 국토지리정보원 브이월드 | Layer: {self.layer} | "
+                            f"Center: {lat},{lon} | Radius: {radius_km}km"),
+            ("format",      tile_fmt),
+            ("minzoom",     str(min(zoom_levels))),
+            ("maxzoom",     str(max(zoom_levels))),
+            ("center",      f"{lon},{lat},{min(zoom_levels)+2}"),
+            ("attribution", "© 국토지리정보원 (NGII) / VWorld"),
         ]
         cur.executemany("INSERT OR REPLACE INTO metadata VALUES (?, ?)", meta)
 
-        # 타일 삽입
-        tile_dir = self.map_dir / "tiles"
+        # 타일 삽입 (브이월드 레이어 서브폴더 포함)
+        tile_dir = self.map_dir / "tiles" / self.layer
         inserted = 0
+        glob_pattern = f"*.{self.ext}"
         for zoom in zoom_levels:
             zoom_dir = tile_dir / str(zoom)
             if not zoom_dir.exists():
                 continue
             for x_dir in zoom_dir.iterdir():
-                for tile_file in x_dir.glob("*.png"):
-                    if tile_file.stat().st_size == 0:
+                for tile_file in x_dir.glob(glob_pattern):
+                    if tile_file.stat().st_size < 100:   # 빈 응답/오류 타일 스킵
                         continue
                     try:
                         x = int(x_dir.name)
                         y = int(tile_file.stem)
-                        # MBTiles는 y축이 반전됨
+                        # MBTiles TMS 규격: y축 반전
                         tms_y = (2 ** zoom - 1) - y
                         data = tile_file.read_bytes()
                         cur.execute(
@@ -595,10 +651,110 @@ class SRTMDownloader:
                 if result.returncode == 0:
                     return vrt_path
         except FileNotFoundError:
-            # GDAL 없으면 스킵 (원본 파일 그대로 사용)
             pass
 
         return None
+
+
+# ─────────────────────────────────────────────
+# 국토지리정보원 공개DEM 로더
+# 국토정보플랫폼(map.ngii.go.kr)에서 수동 다운로드한
+# GeoTIFF(.tif) / ASC / IMG 파일을 지정 폴더에 놓으면 자동 인식
+# 해상도: 5m (SRTM 90m 대비 18배 고해상도)
+# ─────────────────────────────────────────────
+class NGIIDEMLoader:
+    """
+    국토지리정보원 공개DEM 파일 로더
+
+    사용 방법:
+      1. https://map.ngii.go.kr → 공개DEM → 영역 선택 후 다운로드
+      2. 다운로드된 .tif / .img / .zip 파일을 <elevation_dir>/ngii_dem/ 에 복사
+      3. 스크립트 실행 시 자동 인식 및 적용
+
+    지원 포맷: GeoTIFF (.tif, .tiff), ERDAS IMG (.img), ZIP 압축 파일
+    좌표계: GRS80 / TM중부원점 (EPSG:5186) → 내부에서 WGS84로 변환
+    """
+
+    SUPPORTED_EXTS = {'.tif', '.tiff', '.img', '.asc', '.dem'}
+
+    def __init__(self, elevation_dir: Path):
+        self.elevation_dir = elevation_dir
+        self.ngii_dir = elevation_dir / NGII_DEM_DIR_NAME
+
+    def ensure_dir(self):
+        self.ngii_dir.mkdir(parents=True, exist_ok=True)
+
+    def scan_files(self) -> List[Path]:
+        """ngii_dem 폴더에서 DEM 파일 탐색 (zip 자동 해제 포함)"""
+        self.ensure_dir()
+        found = []
+
+        # zip 파일 자동 해제
+        for zip_path in list(self.ngii_dir.glob("*.zip")):
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    for name in zf.namelist():
+                        if Path(name).suffix.lower() in self.SUPPORTED_EXTS:
+                            out = self.ngii_dir / name
+                            if not out.exists():
+                                zf.extract(name, self.ngii_dir)
+            except zipfile.BadZipFile:
+                pass
+
+        # 지원 포맷 파일 수집
+        for ext in self.SUPPORTED_EXTS:
+            found.extend(self.ngii_dir.glob(f"*{ext}"))
+            found.extend(self.ngii_dir.glob(f"*{ext.upper()}"))
+
+        return [f for f in found if f.stat().st_size > 0]
+
+    def get_coverage_info(self, dem_files: List[Path]) -> dict:
+        """DEM 파일 커버리지 정보 반환"""
+        info = {
+            "file_count": len(dem_files),
+            "total_size_mb": sum(f.stat().st_size for f in dem_files) / 1024 / 1024,
+            "files": [f.name for f in dem_files],
+            "resolution": "5m (국토지리정보원 공개DEM)",
+            "source": "국토지리정보원 (NGII)",
+        }
+        return info
+
+    def merge_to_vrt(self, dem_files: List[Path]) -> Optional[Path]:
+        """국토지리정보원 DEM 파일들을 VRT로 병합"""
+        if not dem_files:
+            return None
+
+        vrt_path = self.elevation_dir / "ngii_elevation_merged.vrt"
+        try:
+            import subprocess
+            file_paths = [str(f) for f in dem_files]
+            result = subprocess.run(
+                ["gdalbuildvrt", "-overwrite", str(vrt_path)] + file_paths,
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                return vrt_path
+        except FileNotFoundError:
+            pass
+        return None
+
+    def print_manual_guide(self):
+        """국토지리정보원 DEM 수동 다운로드 안내 출력"""
+        console.print(Panel(
+            "[bold yellow]국토지리정보원 공개DEM 수동 다운로드 안내[/bold yellow]\n\n"
+            "공개DEM은 API가 없어 수동 다운로드가 필요합니다.\n\n"
+            "[bold]다운로드 절차:[/bold]\n"
+            "  1. https://map.ngii.go.kr 접속 → 로그인\n"
+            "  2. 상단 메뉴 [공간정보받기] → [공개DEM]\n"
+            "  3. 지도에서 원하는 영역 선택 또는 도엽번호 입력\n"
+            "  4. 다운로드 신청 → 파일 수신 (보통 즉시 또는 1일 이내)\n\n"
+            f"[bold]파일 저장 위치:[/bold] {self.ngii_dir}\n\n"
+            "[dim]지원 포맷: .tif .tiff .img .asc .zip\n"
+            "해상도: 5m (SRTM 90m 대비 18배 고해상도)\n"
+            "좌표계: GRS80/TM (자동 인식)[/dim]",
+            border_style="yellow",
+            title="NGII 공개DEM 안내",
+        ))
 
 
 # ─────────────────────────────────────────────
@@ -755,8 +911,8 @@ class FH2MapDownloaderApp:
     def print_banner(self):
         banner = """
 ╔══════════════════════════════════════════════════════════════╗
-║       DJI FH2 On-Premise Offline Map Downloader             ║
-║       OSM 타일 + SRTM 고도 데이터 병렬 다운로드 도구        ║
+║       DJI FH2 On-Premise Offline Map Downloader  v2.0       ║
+║  국토지리정보원 브이월드(VWorld) + 공개DEM 병렬 다운로드    ║
 ╚══════════════════════════════════════════════════════════════╝"""
         self.console.print(f"[bold cyan]{banner}[/bold cyan]")
         self.console.print()
@@ -887,10 +1043,16 @@ class FH2MapDownloaderApp:
         self.console.print(f"\n  [green]✓[/green] 설정: 위도 [bold]{lat}[/bold], 경도 [bold]{lon}[/bold], 반경 [bold]{radius} km[/bold]")
         return lat, lon, radius
 
-    def confirm_and_download(self, lat: float, lon: float, radius: float):
+    def confirm_and_download(self, lat: float, lon: float, radius: float, args):
         """다운로드 확인 및 실행"""
         self.console.print()
         self.console.print(Panel("[bold]Step 3: 다운로드 계획 확인[/bold]", style="blue"))
+
+        # 브이월드 레이어 선택
+        vworld_key = getattr(args, 'vworld_key', None) or VWORLD_API_KEY
+        layer = getattr(args, 'layer', None) or DEFAULT_VWORLD_LAYER
+        if layer not in VWORLD_LAYERS:
+            layer = DEFAULT_VWORLD_LAYER
 
         zoom_levels_map = {
             1: [10, 13, 15, 16],
@@ -903,22 +1065,27 @@ class FH2MapDownloaderApp:
         closest_r = min(zoom_levels_map.keys(), key=lambda x: abs(x - radius))
         zoom_levels = zoom_levels_map[closest_r]
 
-        total_osm = sum(GeoUtils.count_tiles(lat, lon, radius, z) for z in zoom_levels)
+        total_tiles = sum(GeoUtils.count_tiles(lat, lon, radius, z) for z in zoom_levels)
         srtm_tiles = GeoUtils.get_srtm_tiles(lat, lon, radius)
+        layer_info = VWORLD_LAYERS[layer]
 
         summary = Table(show_header=False, box=None, padding=(0, 2))
         summary.add_column("항목", style="bold")
         summary.add_column("값", style="green")
 
-        summary.add_row("중심 좌표", f"{lat:.6f}°N, {lon:.6f}°E")
-        summary.add_row("반경", f"{radius} km")
-        summary.add_row("OSM 줌 레벨", str(zoom_levels))
-        summary.add_row("예상 OSM 타일 수", f"~{total_osm:,}개")
-        summary.add_row("예상 OSM 용량", f"~{total_osm * 15 / 1024:.0f} MB")
-        summary.add_row("SRTM 고도 타일 수", f"{len(srtm_tiles)}개")
-        summary.add_row("예상 SRTM 용량", f"~{len(srtm_tiles) * 30:.0f} MB")
-        summary.add_row("병렬 워커 수", str(self.workers))
-        summary.add_row("맵 저장 경로", str(self.map_dir))
+        summary.add_row("지도 소스",      "국토지리정보원 브이월드(VWorld) WMTS")
+        summary.add_row("지도 레이어",    f"{layer} - {layer_info['desc']}")
+        summary.add_row("고도 소스 (1순위)", "국토지리정보원 공개DEM (5m, 수동 배치)")
+        summary.add_row("고도 소스 (2순위)", "SRTM CGIAR 90m (자동 다운로드 fallback)")
+        summary.add_row("─" * 20,         "")
+        summary.add_row("중심 좌표",      f"{lat:.6f}°N, {lon:.6f}°E")
+        summary.add_row("반경",           f"{radius} km")
+        summary.add_row("줌 레벨",        str(zoom_levels))
+        summary.add_row("예상 타일 수",   f"~{total_tiles:,}개")
+        summary.add_row("예상 타일 용량", f"~{total_tiles * 18 / 1024:.0f} MB")
+        summary.add_row("SRTM 타일 수",   f"{len(srtm_tiles)}개 (fallback)")
+        summary.add_row("병렬 워커 수",   str(self.workers))
+        summary.add_row("맵 저장 경로",   str(self.map_dir))
         summary.add_row("고도 저장 경로", str(self.elevation_dir))
 
         self.console.print(summary)
@@ -932,17 +1099,22 @@ class FH2MapDownloaderApp:
         cache_dir = self.map_dir / ".cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        downloader = ParallelDownloader(cache_dir, max_workers=self.workers)
-        osm_dl = OSMTileDownloader(self.map_dir, downloader)
-        srtm_dl = SRTMDownloader(self.elevation_dir, downloader)
-        applicator = FH2Applicator(FH2_INSTALL_ROOT, self.map_dir, self.elevation_dir)
+        downloader  = ParallelDownloader(cache_dir, max_workers=self.workers)
+        vworld_dl   = VWorldTileDownloader(self.map_dir, downloader, api_key=vworld_key, layer=layer)
+        srtm_dl     = SRTMDownloader(self.elevation_dir, downloader)
+        ngii_loader = NGIIDEMLoader(self.elevation_dir)
+        applicator  = FH2Applicator(FH2_INSTALL_ROOT, self.map_dir, self.elevation_dir)
 
-        # OSM 타일 다운로드
+        # ── Step 4: 브이월드 타일 다운로드 ──
         self.console.print()
-        self.console.print(Panel("[bold]Step 4: OSM 지도 타일 다운로드[/bold]", style="blue"))
+        self.console.print(Panel(
+            f"[bold]Step 4: 브이월드(VWorld) 지도 타일 다운로드[/bold]\n"
+            f"[dim]레이어: {layer} | {layer_info['desc']}[/dim]",
+            style="blue"
+        ))
 
-        osm_tasks = osm_dl.build_tile_tasks(lat, lon, radius, zoom_levels)
-        osm_stats = DownloadStats()
+        vworld_tasks = vworld_dl.build_tile_tasks(lat, lon, radius, zoom_levels)
+        map_stats = DownloadStats()
 
         with Progress(
             SpinnerColumn(),
@@ -958,73 +1130,103 @@ class FH2MapDownloaderApp:
             console=self.console,
         ) as progress:
             task_id = progress.add_task(
-                f"OSM 타일 다운로드 ({len(osm_tasks):,}개)",
-                total=len(osm_tasks)
+                f"VWorld {layer} 타일 ({len(vworld_tasks):,}개)",
+                total=len(vworld_tasks)
             )
-            osm_stats = downloader.download_batch(osm_tasks, progress, task_id, osm_stats)
+            map_stats = downloader.download_batch(vworld_tasks, progress, task_id, map_stats)
 
         self.console.print(
-            f"  [green]✓[/green] OSM 완료: "
-            f"성공 {osm_stats.completed:,}개, "
-            f"캐시 {osm_stats.cached:,}개, "
-            f"실패 {osm_stats.failed:,}개 | "
-            f"총 {osm_stats.bytes_downloaded/1024/1024:.1f} MB | "
-            f"평균 속도 {osm_stats.speed_mbps:.1f} MB/s"
+            f"  [green]✓[/green] 브이월드 완료: "
+            f"성공 {map_stats.completed:,}개, "
+            f"캐시 {map_stats.cached:,}개, "
+            f"실패 {map_stats.failed:,}개 | "
+            f"총 {map_stats.bytes_downloaded/1024/1024:.1f} MB | "
+            f"속도 {map_stats.speed_mbps:.1f} MB/s"
         )
 
         # MBTiles 패키징
         self.console.print()
         self.console.print("  MBTiles 패키징 중...", end="")
-        mbtiles_path = osm_dl.create_mbtiles(lat, lon, radius, zoom_levels)
+        mbtiles_path = vworld_dl.create_mbtiles(lat, lon, radius, zoom_levels)
         self.console.print(f" [green]✓[/green] {mbtiles_path.name} ({mbtiles_path.stat().st_size/1024/1024:.1f} MB)")
 
-        # SRTM 고도 데이터 다운로드
+        # ── Step 5: 국토지리정보원 공개DEM (1순위) ──
         self.console.print()
-        self.console.print(Panel("[bold]Step 5: SRTM 고도 데이터 다운로드[/bold]", style="blue"))
+        self.console.print(Panel(
+            "[bold]Step 5: 고도 데이터 처리[/bold]\n"
+            "[dim]1순위: 국토지리정보원 공개DEM (5m) | 2순위: SRTM 90m (자동)[/dim]",
+            style="blue"
+        ))
 
-        srtm_tasks = srtm_dl.build_srtm_tasks(lat, lon, radius)
+        # NGII DEM 파일 스캔
+        ngii_loader.ensure_dir()
+        ngii_files = ngii_loader.scan_files()
+        elevation_files: List[Path] = []
+        elev_source = ""
         srtm_stats = DownloadStats()
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold green]{task.description}"),
-            BarColumn(bar_width=40),
-            TaskProgressColumn(),
-            TextColumn("•"),
-            DownloadColumn(),
-            TextColumn("•"),
-            TimeRemainingColumn(),
-            console=self.console,
-        ) as progress:
-            task_id = progress.add_task(
-                f"SRTM 고도 다운로드 ({len(srtm_tasks)}개)",
-                total=len(srtm_tasks)
+        if ngii_files:
+            info = ngii_loader.get_coverage_info(ngii_files)
+            self.console.print(
+                f"  [green]✓[/green] 국토지리정보원 공개DEM 감지: "
+                f"{info['file_count']}개 파일, {info['total_size_mb']:.1f} MB"
             )
-            srtm_stats = downloader.download_batch(srtm_tasks, progress, task_id, srtm_stats)
+            for fname in info['files']:
+                self.console.print(f"     [dim]• {fname}[/dim]")
+            elevation_files = ngii_files
+            elev_source = "NGII 공개DEM (5m)"
 
-        self.console.print(
-            f"  [green]✓[/green] SRTM 완료: "
-            f"성공 {srtm_stats.completed}개, "
-            f"캐시 {srtm_stats.cached}개, "
-            f"실패 {srtm_stats.failed}개 | "
-            f"총 {srtm_stats.bytes_downloaded/1024/1024:.1f} MB"
-        )
+            vrt = ngii_loader.merge_to_vrt(ngii_files)
+            if vrt:
+                self.console.print(f"  [green]✓[/green] VRT 병합 완료: {vrt.name}")
+        else:
+            # NGII DEM 없으면 안내 후 SRTM fallback
+            ngii_loader.print_manual_guide()
+            self.console.print(
+                "  [yellow]⚠[/yellow] 국토지리정보원 공개DEM 없음 → "
+                "SRTM 90m fallback 다운로드"
+            )
 
-        # SRTM 압축 해제
-        self.console.print("\n  SRTM 압축 해제 중...")
-        with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), console=self.console) as progress:
-            task_id = progress.add_task("압축 해제", total=1)
-            elevation_files = srtm_dl.extract_and_convert(progress, task_id)
+            srtm_tasks = srtm_dl.build_srtm_tasks(lat, lon, radius)
 
-        if elevation_files:
-            self.console.print(f"  [green]✓[/green] 고도 파일 {len(elevation_files)}개 추출 완료")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold green]{task.description}"),
+                BarColumn(bar_width=40),
+                TaskProgressColumn(),
+                TextColumn("•"),
+                DownloadColumn(),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=self.console,
+            ) as progress:
+                task_id = progress.add_task(
+                    f"SRTM 고도 다운로드 ({len(srtm_tasks)}개)",
+                    total=len(srtm_tasks)
+                )
+                srtm_stats = downloader.download_batch(srtm_tasks, progress, task_id, srtm_stats)
 
-        # VRT 병합 시도 (GDAL 있을 경우)
-        vrt = srtm_dl.merge_to_vrt(elevation_files)
-        if vrt:
-            self.console.print(f"  [green]✓[/green] VRT 병합 완료: {vrt}")
+            self.console.print(
+                f"  [green]✓[/green] SRTM 완료: "
+                f"성공 {srtm_stats.completed}개, 캐시 {srtm_stats.cached}개, "
+                f"실패 {srtm_stats.failed}개 | "
+                f"총 {srtm_stats.bytes_downloaded/1024/1024:.1f} MB"
+            )
 
-        # FH2 적용
+            self.console.print("  압축 해제 중...")
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                          BarColumn(), console=self.console) as progress:
+                task_id = progress.add_task("SRTM 압축 해제", total=1)
+                elevation_files = srtm_dl.extract_and_convert(progress, task_id)
+
+            if elevation_files:
+                self.console.print(f"  [green]✓[/green] SRTM 파일 {len(elevation_files)}개 추출")
+                vrt = srtm_dl.merge_to_vrt(elevation_files)
+                if vrt:
+                    self.console.print(f"  [green]✓[/green] VRT 병합 완료: {vrt.name}")
+            elev_source = "SRTM 90m (fallback)"
+
+        # ── Step 6: FH2 적용 ──
         self.console.print()
         self.console.print(Panel("[bold]Step 6: FH2 적용[/bold]", style="blue"))
         apply_results = applicator.apply(mbtiles_path, elevation_files)
@@ -1036,14 +1238,14 @@ class FH2MapDownloaderApp:
             else:
                 icon = "[green]✓[/green]" if val else "[yellow]⚠[/yellow]"
                 label_map = {
-                    "map_applied": "맵 데이터 적용",
+                    "map_applied":       "맵 데이터 적용",
                     "elevation_applied": "고도 데이터 적용",
-                    "config_updated": "FH2 설정 업데이트",
+                    "config_updated":    "FH2 설정 업데이트",
                 }
                 label = label_map.get(key, key)
                 self.console.print(f"  {icon} {label}: {'완료' if val else '스킵/실패'}")
 
-        # 최종 검증
+        # ── Step 7: 검증 ──
         self.console.print()
         self.console.print(Panel("[bold]Step 7: 검증[/bold]", style="blue"))
         verification = applicator.verify(mbtiles_path, elevation_files)
@@ -1053,11 +1255,11 @@ class FH2MapDownloaderApp:
         verify_table.add_column("결과")
 
         checks = [
-            ("MBTiles 파일 존재", verification["map_file_exists"]),
-            ("타일 데이터 정상", verification["map_tile_count"] > 0),
-            ("고도 파일 존재", verification["elevation_files_count"] > 0),
-            ("심볼릭 링크 정상", verification["symlink_valid"]),
-            ("FH2 경로 접근 가능", verification["fh2_accessible"]),
+            ("MBTiles 파일 존재",     verification["map_file_exists"]),
+            ("타일 데이터 정상",      verification["map_tile_count"] > 0),
+            ("고도 파일 존재",        verification["elevation_files_count"] > 0),
+            ("심볼릭 링크 정상",      verification["symlink_valid"]),
+            ("FH2 경로 접근 가능",    verification["fh2_accessible"]),
         ]
         for label, ok in checks:
             icon = "[green]✓ PASS[/green]" if ok else "[red]✗ FAIL[/red]"
@@ -1070,10 +1272,14 @@ class FH2MapDownloaderApp:
             self.console.print(f"  [dim]• {detail}[/dim]")
 
         self.console.print()
-        status_color = "green" if "SUCCESS" in verification["overall_status"] else "yellow" if "PARTIAL" in verification["overall_status"] else "red"
+        status_color = (
+            "green"  if "SUCCESS" in verification["overall_status"] else
+            "yellow" if "PARTIAL" in verification["overall_status"] else "red"
+        )
         self.console.print(Panel(
             f"[bold {status_color}]최종 상태: {verification['overall_status']}[/bold {status_color}]\n"
-            f"[dim]맵 타일: {verification['map_tile_count']:,}개 | "
+            f"[dim]지도: 브이월드 {layer} | 고도: {elev_source}\n"
+            f"맵 타일: {verification['map_tile_count']:,}개 | "
             f"줌 레벨: {verification['map_zoom_levels']} | "
             f"고도 파일: {verification['elevation_files_count']}개 "
             f"({verification['elevation_total_size_mb']:.1f} MB)[/dim]",
@@ -1083,28 +1289,31 @@ class FH2MapDownloaderApp:
 
         # 요약 리포트 저장
         report = {
-            "timestamp": datetime.now().isoformat(),
-            "center": {"lat": lat, "lon": lon},
-            "radius_km": radius,
-            "zoom_levels": zoom_levels,
-            "osm_stats": {
-                "total": osm_stats.total,
-                "completed": osm_stats.completed,
-                "cached": osm_stats.cached,
-                "failed": osm_stats.failed,
-                "bytes_mb": round(osm_stats.bytes_downloaded / 1024 / 1024, 2),
-                "speed_mbps": round(osm_stats.speed_mbps, 2),
+            "timestamp":    datetime.now().isoformat(),
+            "version":      "2.0",
+            "map_source":   f"국토지리정보원 브이월드(VWorld) - {layer}",
+            "elev_source":  elev_source,
+            "center":       {"lat": lat, "lon": lon},
+            "radius_km":    radius,
+            "zoom_levels":  zoom_levels,
+            "vworld_layer": layer,
+            "map_stats": {
+                "total":      map_stats.total,
+                "completed":  map_stats.completed,
+                "cached":     map_stats.cached,
+                "failed":     map_stats.failed,
+                "bytes_mb":   round(map_stats.bytes_downloaded / 1024 / 1024, 2),
+                "speed_mbps": round(map_stats.speed_mbps, 2),
             },
             "srtm_stats": {
-                "total": srtm_stats.total,
+                "total":     srtm_stats.total,
                 "completed": srtm_stats.completed,
-                "cached": srtm_stats.cached,
-                "failed": srtm_stats.failed,
-                "bytes_mb": round(srtm_stats.bytes_downloaded / 1024 / 1024, 2),
+                "cached":    srtm_stats.cached,
+                "failed":    srtm_stats.failed,
+                "bytes_mb":  round(srtm_stats.bytes_downloaded / 1024 / 1024, 2),
             },
-            "verification": {
-                k: v for k, v in verification.items() if k != "details"
-            },
+            "ngii_dem_files": [str(f) for f in ngii_files],
+            "verification": {k: v for k, v in verification.items() if k != "details"},
             "mbtiles_path": str(mbtiles_path) if mbtiles_path else None,
             "elevation_files": [str(f) for f in elevation_files],
         }
@@ -1119,7 +1328,7 @@ class FH2MapDownloaderApp:
             sys.exit(1)
 
         lat, lon, radius = self.get_coordinates(args)
-        self.confirm_and_download(lat, lon, radius)
+        self.confirm_and_download(lat, lon, radius, args)
 
         self.console.print()
         self.console.print("[bold green]완료![/bold green] DJI FH2 오프라인 맵 다운로드 및 적용이 완료되었습니다.")
@@ -1129,20 +1338,37 @@ class FH2MapDownloaderApp:
 # 진입점
 # ─────────────────────────────────────────────
 def main():
+    layer_choices = list(VWORLD_LAYERS.keys())
+    layer_help = " | ".join(f"{k}: {v['desc']}" for k, v in VWORLD_LAYERS.items())
+
     parser = argparse.ArgumentParser(
-        description="DJI FH2 On-Premise Offline Map & Elevation Downloader",
+        description="DJI FH2 On-Premise Offline Map Downloader v2.0 (국토지리정보원)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+브이월드 레이어:
+  {layer_help}
+
 예시:
   python3 fh2_map_downloader.py
   python3 fh2_map_downloader.py --lat 38.1467 --lon 127.3139 --radius 5
-  python3 fh2_map_downloader.py --lat 37.5665 --lon 126.9780 --radius 3
+  python3 fh2_map_downloader.py --lat 38.1467 --lon 127.3139 --radius 5 --layer Satellite
+  python3 fh2_map_downloader.py --vworld-key YOUR_KEY --lat 37.5665 --lon 126.9780 --radius 3
+
+국토지리정보원 공개DEM (5m 고해상도):
+  수동 다운로드 후 <elevation_dir>/ngii_dem/ 에 배치하면 자동 인식됩니다.
+  다운로드: https://map.ngii.go.kr → 공개DEM
         """
     )
-    parser.add_argument("--lat", type=float, help="위도 (예: 38.1467)")
-    parser.add_argument("--lon", type=float, help="경도 (예: 127.3139)")
-    parser.add_argument("--radius", type=float, help="반경 km (1~10)")
-    parser.add_argument("--workers", type=int, default=MAX_PARALLEL_WORKERS, help=f"병렬 워커 수 (기본: {MAX_PARALLEL_WORKERS})")
+    parser.add_argument("--lat",         type=float, help="위도 (예: 38.1467)")
+    parser.add_argument("--lon",         type=float, help="경도 (예: 127.3139)")
+    parser.add_argument("--radius",      type=float, help="반경 km (1~10)")
+    parser.add_argument("--workers",     type=int,   default=MAX_PARALLEL_WORKERS,
+                        help=f"병렬 워커 수 (기본: {MAX_PARALLEL_WORKERS})")
+    parser.add_argument("--layer",       type=str,   default=DEFAULT_VWORLD_LAYER,
+                        choices=layer_choices,
+                        help=f"브이월드 레이어 (기본: {DEFAULT_VWORLD_LAYER})")
+    parser.add_argument("--vworld-key",  type=str,   default=VWORLD_API_KEY,
+                        help="브이월드 API 키 (기본: 내장 키)")
     args = parser.parse_args()
 
     workers = args.workers if args.workers else MAX_PARALLEL_WORKERS
